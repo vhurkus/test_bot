@@ -4,50 +4,97 @@
  */
 
 import { config } from './config';
-import { logger } from './utils/logger';
+import { logger, systemLogger } from './utils/logger';
+import { initializeDatabase, closeDatabase } from './database';
+import { redisClient } from './database/redis';
+import { ExchangeFactory } from './exchanges';
+import { OrderManager } from './services/order/OrderManager';
+import { BalanceManager } from './services/balance/BalanceManager';
+import { gracefulShutdown } from './utils/gracefulShutdown';
+
+let orderManager: OrderManager;
+let balanceManager: BalanceManager;
 
 async function main() {
   try {
     logger.info('🚀 Starting Maker-Taker Arbitrage Bot...');
     logger.info(`Environment: ${config.env}`);
     logger.info(`Log Level: ${config.logLevel}`);
+    logger.info(`Trading Enabled: ${config.trading.enableTrading}`);
+    logger.info(`Paper Trading: ${config.trading.enablePaperTrading}`);
 
-    // TODO: Initialize database connections
-    // TODO: Initialize Redis connection
-    // TODO: Initialize exchange connectors
-    // TODO: Start trading engine
+    // Initialize database connections
+    systemLogger.info('Initializing database connections...');
+    await initializeDatabase();
+    await redisClient.connect();
+
+    // Initialize exchange connectors
+    systemLogger.info('Initializing exchange connectors...');
+    await ExchangeFactory.initializeAll();
+
+    // Test exchange connections
+    systemLogger.info('Testing exchange connections...');
+    const connectionTests = await ExchangeFactory.testAllConnections();
+    systemLogger.info('Connection test results:', connectionTests);
+
+    // Initialize Order Manager
+    systemLogger.info('Initializing Order Manager...');
+    orderManager = new OrderManager();
+    orderManager.start();
+
+    // Initialize Balance Manager
+    systemLogger.info('Initializing Balance Manager...');
+    balanceManager = new BalanceManager();
+
+    // Register exchanges with Balance Manager
+    for (const exchange of ExchangeFactory.getAllExchanges()) {
+      balanceManager.registerExchange(exchange);
+    }
+
+    balanceManager.start();
+
+    // Register shutdown handlers
+    gracefulShutdown.registerHandler('orderManager', async () => {
+      orderManager.stop();
+    });
+
+    gracefulShutdown.registerHandler('balanceManager', async () => {
+      balanceManager.stop();
+    });
+
+    gracefulShutdown.registerHandler('exchanges', async () => {
+      await ExchangeFactory.closeAll();
+    });
+
+    gracefulShutdown.registerHandler('database', async () => {
+      await closeDatabase();
+      await redisClient.disconnect();
+    });
+
+    // TODO: Start trading strategy engine
 
     logger.info('✅ Bot started successfully');
+
+    // Log system status periodically
+    setInterval(() => {
+      const orderStats = orderManager.getStats();
+      const balanceStats = balanceManager.getStats();
+      const exchangeStats = ExchangeFactory.getStats();
+
+      systemLogger.info('System Status:', {
+        orders: orderStats,
+        balances: balanceStats,
+        exchanges: exchangeStats,
+      });
+    }, 60000); // Every minute
   } catch (error) {
     logger.error('❌ Failed to start bot:', error);
     process.exit(1);
   }
 }
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  logger.info('⚠️  Received SIGINT, shutting down gracefully...');
-  // TODO: Close database connections
-  // TODO: Close exchange connections
-  // TODO: Cancel pending orders
-  process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-  logger.info('⚠️  Received SIGTERM, shutting down gracefully...');
-  process.exit(0);
-});
-
-// Handle uncaught errors
-process.on('uncaughtException', (error) => {
-  logger.error('💥 Uncaught Exception:', error);
-  process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
-  process.exit(1);
-});
+// Note: Graceful shutdown is now handled by the gracefulShutdown utility
+// which sets up signal handlers automatically
 
 main().catch((error) => {
   logger.error('💥 Fatal error:', error);
