@@ -10,10 +10,14 @@ import { redisClient } from './database/redis';
 import { ExchangeFactory } from './exchanges';
 import { OrderManager } from './services/order/OrderManager';
 import { BalanceManager } from './services/balance/BalanceManager';
+import { RiskManager } from './services/risk/RiskManager';
+import { ExecutionEngine } from './services/execution/ExecutionEngine';
 import { gracefulShutdown } from './utils/gracefulShutdown';
 
 let orderManager: OrderManager;
 let balanceManager: BalanceManager;
+let riskManager: RiskManager;
+let executionEngine: ExecutionEngine;
 
 async function main() {
   try {
@@ -53,7 +57,49 @@ async function main() {
 
     balanceManager.start();
 
+    // Initialize Risk Manager
+    systemLogger.info('Initializing Risk Manager...');
+    riskManager = new RiskManager(balanceManager);
+
+    // Initialize Execution Engine
+    systemLogger.info('Initializing Execution Engine...');
+    executionEngine = new ExecutionEngine(orderManager, balanceManager, riskManager);
+
+    // Setup execution engine event handlers
+    executionEngine.on('tradeCompleted', ({ symbol, execution }) => {
+      logger.info(`✅ Trade completed for ${symbol}`, {
+        profit: execution.profit,
+        profitPercentage: execution.opportunity.estimatedProfitPercentage,
+      });
+    });
+
+    executionEngine.on('emergencyStop', (reason) => {
+      logger.error(`🚨 EMERGENCY STOP: ${reason}`);
+    });
+
+    executionEngine.on('paperTrade', ({ symbol, opportunity }) => {
+      logger.info(`📝 Paper trade for ${symbol}`, {
+        profit: opportunity.estimatedProfit,
+        profitPercentage: opportunity.estimatedProfitPercentage,
+      });
+    });
+
+    // Start execution engine if trading is enabled
+    if (config.trading.enableTrading || config.trading.enablePaperTrading) {
+      systemLogger.info('Starting Execution Engine...');
+      await executionEngine.start();
+      logger.info('🎯 Execution Engine started - Trading is active');
+    } else {
+      logger.warn('⚠️  Trading is disabled - Bot running in monitor-only mode');
+    }
+
     // Register shutdown handlers
+    gracefulShutdown.registerHandler('executionEngine', async () => {
+      if (executionEngine) {
+        await executionEngine.stop();
+      }
+    });
+
     gracefulShutdown.registerHandler('orderManager', async () => {
       orderManager.stop();
     });
@@ -71,20 +117,23 @@ async function main() {
       await redisClient.disconnect();
     });
 
-    // TODO: Start trading strategy engine
-
     logger.info('✅ Bot started successfully');
+    logger.info('📊 System is ready for arbitrage trading');
 
     // Log system status periodically
     setInterval(() => {
       const orderStats = orderManager.getStats();
       const balanceStats = balanceManager.getStats();
       const exchangeStats = ExchangeFactory.getStats();
+      const engineStats = executionEngine ? executionEngine.getStats() : null;
+      const riskStats = riskManager ? riskManager.getStats() : null;
 
       systemLogger.info('System Status:', {
         orders: orderStats,
         balances: balanceStats,
         exchanges: exchangeStats,
+        engine: engineStats,
+        risk: riskStats,
       });
     }, 60000); // Every minute
   } catch (error) {
